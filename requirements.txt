@@ -1,0 +1,9 @@
+streamlit
+pandas
+requests
+openpyxl
+google-cloud-bigquery
+sqlalchemy
+google-generativeai
+plotly
+playwright>=1.40.0
