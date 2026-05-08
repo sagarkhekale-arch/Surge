@@ -521,6 +521,18 @@ def post_payload(headers: Dict[str, str], payload: Dict[str, Any], timeout: int)
         return False, -1, str(exc)
 
 
+def http_remove_from_retry_queue(ok: bool, code: int) -> bool:
+    """
+    Row leaves the retry queue when:
+    - any 2xx (including 201 Created), or
+    - HTTP 400 (bad request / rejected; do not block the whole batch forever).
+    Other statuses (429, 5xx, -1, etc.) stay queued for another round.
+    """
+    if ok:
+        return True
+    return code == 400
+
+
 def request_json_method(
     url: str,
     method: str,
@@ -922,8 +934,17 @@ with tab_create:
         min_value=0,
         max_value=120,
         value=15,
-        help="Extra pause after a successful surge before the next row. Use 10–20 to reduce 429 / server load. Set 0 to disable.",
+        help="Extra pause after a successful surge before the next row. Use 10-20 to reduce 429 / server load. Set 0 to disable.",
         key="delay_create",
+    )
+    max_surge_rounds = st.number_input(
+        "Max retry rounds for create",
+        min_value=1,
+        max_value=500,
+        value=50,
+        help="After each full pass, rows that got HTTP 201 (or any 2xx) or HTTP 400 are removed from the queue. "
+        "All other responses stay queued and the run starts another pass on what is left. Stops when the queue is empty or this limit is hit.",
+        key="max_surge_rounds",
     )
     upload = st.file_uploader("Upload CSV (create)", type=["csv"], key="upload_create")
 
@@ -974,7 +995,8 @@ with tab_create:
 
         city_cache: Dict[str, List[int]] = {}
         city_cluster_name_cache: Dict[str, Dict[str, int]] = {}
-        rows: List[Dict[str, Any]] = []
+        final_row_results: Dict[int, Dict[str, Any]] = {}
+        attempt_count: Dict[int, int] = {}
         batch_id = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
         master_log_rows: List[Dict[str, Any]] = []
         master_inputs_by_date: Dict[str, List[Dict[str, Any]]] = {}
@@ -990,11 +1012,13 @@ with tab_create:
             msg: str,
             cluster_note: str,
             row_idx: int,
+            retry_round: int = 0,
         ) -> None:
             master_log_rows.append(
                 {
                     "run_batch_id": batch_id,
                     "csv_row_index": row_idx,
+                    "retry_round": retry_round,
                     "resolved_city_key": city_key,
                     "start_time_csv": str(d.get("start_time", "")),
                     "cluster_count": len(payload["cluster"]) if payload and "cluster" in payload else "",
@@ -1013,93 +1037,249 @@ with tab_create:
         prog = st.progress(0)
         total = len(df)
         wait_status = st.empty()
+        live_box = st.empty()
+        live_lines: List[str] = []
 
-        for pos, (i, row) in enumerate(df.iterrows()):
-            d = row.to_dict()
-            city_key = resolve_city_key(d)
-            city_id_raw = d.get("city")
-            city_id: int | None = None
-            try:
-                if city_id_raw is not None and str(city_id_raw).strip() != "":
-                    city_id = int(float(city_id_raw))
-            except Exception:
-                city_id = None
+        def flush_live() -> None:
+            tail = live_lines[-45:]
+            live_box.markdown(
+                "**Live status**\n\n" + ("\n\n".join(tail) if tail else "_Starting..._")
+            )
 
-            cache_key = f"id:{city_id}" if city_id is not None else f"name:{city_key}"
-            if city_id is None and not city_key:
-                msg_e = "city is missing or invalid"
-                rows.append({"row": i + 1, "success": False, "status": -1, "msg": msg_e})
-                record_master_excel_row(d, city_key, city_id_raw, None, None, False, -1, msg_e, "", i + 1)
-                prog.progress((i + 1) / total if total else 1)
-                continue
+        max_r = max(1, int(st.session_state.get("max_surge_rounds", 50)))
+        pending: List[Tuple[int, Dict[str, Any]]] = [
+            (pos + 1, row.to_dict()) for pos, (_, row) in enumerate(df.iterrows())
+        ]
+        round_no = 0
 
-            if cache_key not in city_cache:
-                ids, name_map, ferr = fetch_city_clusters(headers, city_id, city_key, int(timeout))
-                if ferr:
-                    msg_e = f"cluster fetch: {ferr}"
-                    rows.append({"row": i + 1, "city": city_key, "success": False, "status": -1, "msg": msg_e})
-                    record_master_excel_row(d, city_key, city_id_raw, None, None, False, -1, msg_e, "", i + 1)
-                    prog.progress((i + 1) / total if total else 1)
-                    continue
-                city_cache[cache_key] = ids
-                city_cluster_name_cache[cache_key] = name_map
+        def finalize_row(
+            row_label: int,
+            *,
+            city_key: str,
+            success: bool,
+            status: int,
+            msg: str,
+            cluster_count: int | str = "",
+        ) -> None:
+            prev = final_row_results.get(row_label, {})
+            final_row_results[row_label] = {
+                "row": row_label,
+                "city": prev.get("city", city_key or ""),
+                "cluster_count": cluster_count if cluster_count != "" else prev.get("cluster_count", ""),
+                "success": success,
+                "status": status,
+                "msg": msg,
+                "attempts": attempt_count.get(row_label, 1),
+            }
 
-            cluster_ids: List[int] | None = None
-            cluster_note = ""
-            payload: Dict[str, Any] | None = None
-            try:
-                cluster_ids, cluster_note = choose_cluster_ids(
-                    d,
-                    city_cache[cache_key],
-                    city_cluster_name_cache.get(cache_key, {}),
-                )
-                if not cluster_ids:
-                    msg_e = f"cluster select: {cluster_note}"
-                    rows.append(
-                        {
-                            "row": i + 1,
-                            "city": city_key,
-                            "success": False,
-                            "status": -1,
-                            "msg": msg_e,
-                        }
+        while pending and round_no < max_r:
+            round_no += 1
+            next_pending: List[Tuple[int, Dict[str, Any]]] = []
+            n_in_round = len(pending)
+            flush_live()
+
+            for j, (row_label, d) in enumerate(pending):
+                attempt_count[row_label] = attempt_count.get(row_label, 0) + 1
+                city_key = resolve_city_key(d)
+                city_id_raw = d.get("city")
+                city_id: int | None = None
+                try:
+                    if city_id_raw is not None and str(city_id_raw).strip() != "":
+                        city_id = int(float(city_id_raw))
+                except Exception:
+                    city_id = None
+
+                cache_key = f"id:{city_id}" if city_id is not None else f"name:{city_key}"
+                prog.progress(
+                    min(
+                        1.0,
+                        (round_no - 1 + (j + 1) / max(n_in_round, 1)) / max(max_r, 1),
                     )
+                )
+
+                if city_id is None and not city_key:
+                    msg_e = "city is missing or invalid"
+                    finalize_row(row_label, city_key=city_key, success=False, status=-1, msg=msg_e)
                     record_master_excel_row(
-                        d, city_key, city_id_raw, None, None, False, -1, msg_e, cluster_note, i + 1
+                        d, city_key, city_id_raw, None, None, False, -1, msg_e, "", row_label, round_no
                     )
-                    prog.progress((i + 1) / total if total else 1)
+                    live_lines.append(
+                        f"R{round_no} row **{row_label}** | skip | {msg_e}"
+                    )
+                    flush_live()
                     continue
 
-                payload = build_payload(d, cluster_ids)
-                ok, code, msg = post_payload(headers, payload, int(timeout))
-                msg_out = msg if not cluster_note else f"{cluster_note} | {msg}"
-                rows.append(
-                    {
-                        "row": i + 1,
-                        "city": city_key,
-                        "cluster_count": len(payload["cluster"]),
-                        "success": ok,
-                        "status": code,
-                        "msg": msg_out,
-                    }
-                )
-                record_master_excel_row(
-                    d, city_key, city_id_raw, cluster_ids, payload, ok, code, msg_out, cluster_note, i + 1
-                )
-                if ok and float(delay_between_surges_sec) > 0 and pos < total - 1:
-                    wait_status.info(f"Waiting {float(delay_between_surges_sec):.0f}s before next surge…")
-                    time.sleep(float(delay_between_surges_sec))
-                    wait_status.empty()
-            except Exception as exc:
-                msg_e = f"payload: {exc}"
-                rows.append({"row": i + 1, "city": city_key, "success": False, "status": -1, "msg": msg_e})
-                record_master_excel_row(
-                    d, city_key, city_id_raw, cluster_ids, payload, False, -1, msg_e, cluster_note, i + 1
-                )
-            prog.progress((i + 1) / total if total else 1)
+                if cache_key not in city_cache:
+                    ids, name_map, ferr = fetch_city_clusters(headers, city_id, city_key, int(timeout))
+                    if ferr:
+                        msg_e = f"cluster fetch: {ferr}"
+                        finalize_row(row_label, city_key=city_key, success=False, status=-1, msg=msg_e)
+                        record_master_excel_row(
+                            d, city_key, city_id_raw, None, None, False, -1, msg_e, "", row_label, round_no
+                        )
+                        live_lines.append(
+                            f"R{round_no} row **{row_label}** | **{city_key or '?'}** | skip | {msg_e}"
+                        )
+                        flush_live()
+                        continue
+                    city_cache[cache_key] = ids
+                    city_cluster_name_cache[cache_key] = name_map
 
+                cluster_ids: List[int] | None = None
+                cluster_note = ""
+                payload: Dict[str, Any] | None = None
+                try:
+                    cluster_ids, cluster_note = choose_cluster_ids(
+                        d,
+                        city_cache[cache_key],
+                        city_cluster_name_cache.get(cache_key, {}),
+                    )
+                    if not cluster_ids:
+                        msg_e = f"cluster select: {cluster_note}"
+                        finalize_row(
+                            row_label,
+                            city_key=city_key,
+                            success=False,
+                            status=-1,
+                            msg=msg_e,
+                        )
+                        record_master_excel_row(
+                            d,
+                            city_key,
+                            city_id_raw,
+                            None,
+                            None,
+                            False,
+                            -1,
+                            msg_e,
+                            cluster_note,
+                            row_label,
+                            round_no,
+                        )
+                        live_lines.append(
+                            f"R{round_no} row **{row_label}** | **{city_key}** | skip | {msg_e}"
+                        )
+                        flush_live()
+                        continue
+
+                    payload = build_payload(d, cluster_ids)
+                    ok, code, msg = post_payload(headers, payload, int(timeout))
+                    msg_out = msg if not cluster_note else f"{cluster_note} | {msg}"
+                    removed = http_remove_from_retry_queue(ok, code)
+                    stat_lbl = f"HTTP **{code}**"
+                    if ok:
+                        stat_lbl += " OK"
+                    elif code == 400:
+                        stat_lbl += " (done, not retrying)"
+
+                    live_lines.append(
+                        f"R{round_no} row **{row_label}** | **{city_key}** | {stat_lbl} "
+                        f"| attempt **{attempt_count[row_label]}**"
+                    )
+                    flush_live()
+
+                    record_master_excel_row(
+                        d,
+                        city_key,
+                        city_id_raw,
+                        cluster_ids,
+                        payload,
+                        ok,
+                        code,
+                        msg_out,
+                        cluster_note,
+                        row_label,
+                        round_no,
+                    )
+
+                    if removed:
+                        finalize_row(
+                            row_label,
+                            city_key=city_key,
+                            success=ok,
+                            status=code,
+                            msg=msg_out,
+                            cluster_count=len(payload["cluster"]),
+                        )
+                        if ok and float(delay_between_surges_sec) > 0 and j < n_in_round - 1:
+                            wait_status.info(
+                                f"Waiting {float(delay_between_surges_sec):.0f}s before next surge..."
+                            )
+                            time.sleep(float(delay_between_surges_sec))
+                            wait_status.empty()
+                    else:
+                        next_pending.append((row_label, d))
+                        live_lines.append(
+                            f"  -> **queued** for next round (queue {len(next_pending)})"
+                        )
+                        flush_live()
+
+                except Exception as exc:
+                    msg_e = f"payload: {exc}"
+                    finalize_row(row_label, city_key=city_key, success=False, status=-1, msg=msg_e)
+                    record_master_excel_row(
+                        d,
+                        city_key,
+                        city_id_raw,
+                        cluster_ids,
+                        payload,
+                        False,
+                        -1,
+                        msg_e,
+                        cluster_note,
+                        row_label,
+                        round_no,
+                    )
+                    live_lines.append(
+                        f"R{round_no} row **{row_label}** | **{city_key}** | error | {msg_e}"
+                    )
+                    flush_live()
+
+            pending = next_pending
+            if pending:
+                live_lines.append(
+                    f"--- End round **{round_no}** / **{max_r}** | **{len(pending)}** row(s) still queued ---"
+                )
+                flush_live()
+
+        if pending:
+            for row_label, d in pending:
+                city_key = resolve_city_key(d)
+                msg_x = (
+                    f"Stopped after {max_r} round(s): still not 2xx/400. Last requeue for this row."
+                )
+                live_lines.append(f"row **{row_label}** | **{city_key}** | {msg_x}")
+                finalize_row(
+                    row_label,
+                    city_key=city_key,
+                    success=False,
+                    status=-3,
+                    msg=msg_x,
+                )
+                record_master_excel_row(
+                    d,
+                    city_key,
+                    d.get("city"),
+                    None,
+                    None,
+                    False,
+                    -3,
+                    msg_x,
+                    "",
+                    row_label,
+                    round_no,
+                )
+            flush_live()
+
+        prog.progress(1.0)
+        rows = [final_row_results[k] for k in sorted(final_row_results)]
         out = pd.DataFrame(rows)
         st.dataframe(out, use_container_width=True)
+        st.caption(
+            f"**Rounds run:** {round_no} / {max_r} max. "
+            "Rows **leave the retry queue** when the API returns **any 2xx (including 201)** "
+            "or **400**. Other status codes are retried until the queue is empty or max rounds."
+        )
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         st.download_button(
             "Download result CSV",
